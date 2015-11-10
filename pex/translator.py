@@ -47,7 +47,8 @@ class ChainedTranslator(TranslatorBase):
         return dist
 
   def __str__(self):
-    return 'ChainedTranslator(%s)' % (', '.join(map(repr, tx) for tx in self._translators))
+    return 'ChainedTranslator(%s)' % (
+        ', '.join((tx.__class__.__name__ for tx in self._translators)))
 
 
 class SourceTranslator(TranslatorBase):
@@ -166,6 +167,7 @@ class Translator(object):
     # TODO(wickman) Consider interpreter=None to indicate "universal" packages
     # since the .whl format can support this.
     # Also consider platform=None to require platform-inspecific packages.
+    # Issue #95.
     interpreter = interpreter or PythonInterpreter.get()
     whl_translator = WheelTranslator(platform=platform, interpreter=interpreter)
     egg_translator = EggTranslator(platform=platform, interpreter=interpreter)

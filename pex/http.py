@@ -12,6 +12,8 @@ from email import message_from_string
 from .common import safe_mkdtemp, safe_open
 from .compatibility import PY3, AbstractClass
 from .tracer import TRACER
+from .variables import ENV
+from .version import __version__ as PEX_VERSION
 
 try:
   import requests
@@ -184,6 +186,7 @@ class StreamFilelike(object):
 
 class RequestsContext(Context):
   """A requests-based Context."""
+  USER_AGENT = 'pex/%s' % PEX_VERSION
 
   @staticmethod
   def _create_session(max_retries):
@@ -191,17 +194,15 @@ class RequestsContext(Context):
     retrying_adapter = requests.adapters.HTTPAdapter(max_retries=max_retries)
     session.mount('http://', retrying_adapter)
     session.mount('https://', retrying_adapter)
-
     return session
 
-  def __init__(self, session=None, verify=True, max_retries=5):
+  def __init__(self, session=None, verify=True, env=ENV):
     if requests is None:
       raise RuntimeError('requests is not available.  Cannot use a RequestsContext.')
 
     self._verify = verify
 
-    max_retries = int(os.environ.get('PEX_HTTP_RETRIES', max_retries))
-
+    max_retries = env.PEX_HTTP_RETRIES
     if max_retries < 0:
       raise ValueError('max_retries may not be negative.')
 
@@ -214,7 +215,9 @@ class RequestsContext(Context):
       return open(link.path, 'rb')  # noqa: T802
     for attempt in range(self._max_retries + 1):
       try:
-        return StreamFilelike(self._session.get(link.url, verify=self._verify, stream=True), link)
+        return StreamFilelike(self._session.get(
+            link.url, verify=self._verify, stream=True, headers={'User-Agent': self.USER_AGENT}),
+            link)
       except requests.exceptions.ReadTimeout:
         # Connect timeouts are handled by the HTTPAdapter, unfortunately read timeouts are not
         # so we'll retry them ourselves.

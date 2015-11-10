@@ -9,7 +9,7 @@ finder only searches paths ending in .egg and not in .whl (zipped or unzipped.)
 pex.finders augments pkg_resources with additional finders to achieve functional
 parity between wheels and eggs in terms of findability with find_distributions.
 
-To use: ::
+To use:
    >>> from pex.finders import register_finders
    >>> register_finders()
 """
@@ -234,3 +234,71 @@ def unregister_finders():
     _remove_finder(importlib_bootstrap.FileFinder, find_wheels_on_path)
 
   __PREVIOUS_FINDER = None
+
+
+def get_script_from_egg(name, dist):
+  """Returns location, content of script in distribution or (None, None) if not there."""
+  if name in dist.metadata_listdir('scripts'):
+    return (
+        os.path.join(dist.egg_info, 'scripts', name),
+        dist.get_metadata('scripts/%s' % name).replace('\r\n', '\n').replace('\r', '\n'))
+  return None, None
+
+
+def safer_name(name):
+  return name.replace('-', '_')
+
+
+def get_script_from_whl(name, dist):
+  # This is true as of at least wheel==0.24.  Might need to take into account the
+  # metadata version bundled with the wheel.
+  wheel_scripts_dir = '%s-%s.data/scripts' % (safer_name(dist.key), dist.version)
+  if dist.resource_isdir(wheel_scripts_dir) and name in dist.resource_listdir(wheel_scripts_dir):
+    script_path = os.path.join(wheel_scripts_dir, name)
+    return (
+        os.path.join(dist.egg_info, script_path),
+        dist.get_resource_string('', script_path).replace(b'\r\n', b'\n').replace(b'\r', b'\n'))
+  return None, None
+
+
+def get_script_from_distribution(name, dist):
+  # PathMetadata: exploded distribution on disk.
+  if isinstance(dist._provider, pkg_resources.PathMetadata):
+    if dist.egg_info.endswith('EGG-INFO'):
+      return get_script_from_egg(name, dist)
+    elif dist.egg_info.endswith('.dist-info'):
+      return get_script_from_whl(name, dist)
+    else:
+      return None, None
+  # FixedEggMetadata: Zipped egg
+  elif isinstance(dist._provider, FixedEggMetadata):
+    return get_script_from_egg(name, dist)
+  # WheelMetadata: Zipped whl (in theory should not experience this at runtime.)
+  elif isinstance(dist._provider, WheelMetadata):
+    return get_script_from_whl(name, dist)
+  return None, None
+
+
+def get_script_from_distributions(name, dists):
+  for dist in dists:
+    script_path, script_content = get_script_from_distribution(name, dist)
+    if script_path:
+      return dist, script_path, script_content
+  return None, None, None
+
+
+def get_entry_point_from_console_script(script, dists):
+  # check all distributions for the console_script "script"
+  entries = frozenset(filter(None, (
+      dist.get_entry_map().get('console_scripts', {}).get(script) for dist in dists)))
+
+  # if multiple matches, freak out
+  if len(entries) > 1:
+    raise RuntimeError(
+        'Ambiguous script specification %s matches multiple entry points:%s' % (
+            script, ' '.join(map(str, entries))))
+
+  if entries:
+    entry_point = next(iter(entries))
+    # entry points are of the form 'foo = bar', we just want the 'bar' part:
+    return str(entry_point).split('=')[1].strip()

@@ -1,7 +1,7 @@
 # Copyright 2014 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-"""pex support for interpreter environments."""
+"""pex support for interacting with interpreters."""
 
 from __future__ import absolute_import
 
@@ -15,15 +15,12 @@ from pkg_resources import Distribution, Requirement, find_distributions
 
 from .base import maybe_requirement
 from .compatibility import string
-from .tracer import TraceLogger
+from .tracer import TRACER
 
 try:
   from numbers import Integral
 except ImportError:
   Integral = (int, long)
-
-
-TRACER = TraceLogger(predicate=TraceLogger.env_filter('PEX_VERBOSE'), prefix='pex.interpreter: ')
 
 
 # Determine in the most platform-compatible way possible the identity of the interpreter
@@ -181,7 +178,10 @@ class PythonIdentity(object):
 class PythonInterpreter(object):
   REGEXEN = (
     re.compile(r'jython$'),
-    re.compile(r'python$'),
+
+    # NB: OSX ships python binaries named Python so we allow for capital-P.
+    re.compile(r'[Pp]ython$'),
+
     re.compile(r'python[23].[0-9]$'),
     re.compile(r'pypy$'),
     re.compile(r'pypy-1.[0-9]$'),

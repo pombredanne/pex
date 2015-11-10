@@ -17,15 +17,13 @@ from pkg_resources import (
     find_distributions
 )
 
-from .common import open_zip, safe_mkdir, safe_rmtree
+from .common import die, open_zip, safe_mkdir, safe_rmtree
 from .interpreter import PythonInterpreter
 from .package import distribution_compatible
 from .pex_builder import PEXBuilder
 from .pex_info import PexInfo
-from .tracer import TraceLogger
+from .tracer import TRACER
 from .util import CacheHelper, DistributionHelper
-
-TRACER = TraceLogger(predicate=TraceLogger.env_filter('PEX_VERBOSE'), prefix='pex.environment: ')
 
 
 class PEXEnvironment(Environment):
@@ -92,7 +90,7 @@ class PEXEnvironment(Environment):
             zip_safe_distributions.append(dist)
             continue
 
-        with TRACER.timed('Caching %s into %s' % (dist, cached_location)):
+        with TRACER.timed('Caching %s' % dist):
           newly_cached_distributions.append(
             CacheHelper.cache_distribution(zf, internal_dist_path, cached_location))
     return existing_cached_distributions, newly_cached_distributions, zip_safe_distributions
@@ -101,7 +99,7 @@ class PEXEnvironment(Environment):
   def load_internal_cache(cls, pex, pex_info):
     """Possibly cache out the internal cache."""
     internal_cache = os.path.join(pex, pex_info.internal_cache)
-    with TRACER.timed('Searching dependency cache: %s' % internal_cache):
+    with TRACER.timed('Searching dependency cache: %s' % internal_cache, V=2):
       if os.path.isdir(pex):
         for dist in find_distributions(internal_cache):
           yield dist
@@ -122,7 +120,7 @@ class PEXEnvironment(Environment):
   def update_candidate_distributions(self, distribution_iter):
     for dist in distribution_iter:
       if self.can_add(dist):
-        with TRACER.timed('Adding %s:%s' % (dist, dist.location)):
+        with TRACER.timed('Adding %s' % dist, V=2):
           self.add(dist)
 
   def can_add(self, dist):
@@ -130,11 +128,49 @@ class PEXEnvironment(Environment):
 
   def activate(self):
     if not self._activated:
-      with TRACER.timed('Activating PEX virtual environment'):
+      with TRACER.timed('Activating PEX virtual environment from %s' % self._pex):
         self._working_set = self._activate()
       self._activated = True
 
     return self._working_set
+
+  def _resolve(self, working_set, reqs):
+    reqs = reqs[:]
+    unresolved_reqs = set()
+    resolveds = set()
+
+    # Resolve them one at a time so that we can figure out which ones we need to elide should
+    # there be an interpreter incompatibility.
+    for req in reqs:
+      with TRACER.timed('Resolving %s' % req, V=2):
+        try:
+          resolveds.update(working_set.resolve([req], env=self))
+        except DistributionNotFound as e:
+          TRACER.log('Failed to resolve a requirement: %s' % e)
+          unresolved_reqs.add(e.args[0].project_name)
+          # Older versions of pkg_resources just call `DistributionNotFound(req)` instead of the
+          # modern `DistributionNotFound(req, requirers)` and so we may not have the 2nd requirers
+          # slot at all.
+          if len(e.args) >= 2 and e.args[1]:
+            unresolved_reqs.update(e.args[1])
+
+    unresolved_reqs = set([req.lower() for req in unresolved_reqs])
+
+    if unresolved_reqs:
+      TRACER.log('Unresolved requirements:')
+      for req in unresolved_reqs:
+        TRACER.log('  - %s' % req)
+      TRACER.log('Distributions contained within this pex:')
+      if not self._pex_info.distributions:
+        TRACER.log('  None')
+      else:
+        for dist in self._pex_info.distributions:
+          TRACER.log('  - %s' % dist)
+      if not self._pex_info.ignore_errors:
+        die('Failed to execute PEX file, missing compatible dependencies for:\n%s' % (
+            '\n'.join(map(str, unresolved_reqs))))
+
+    return resolveds
 
   def _activate(self):
     self.update_candidate_distributions(self.load_internal_cache(self._pex, self._pex_info))
@@ -145,24 +181,14 @@ class PEXEnvironment(Environment):
     all_reqs = [Requirement.parse(req) for req in self._pex_info.requirements]
 
     working_set = WorkingSet([])
-
-    with TRACER.timed('Resolving %s' %
-        ' '.join(map(str, all_reqs)) if all_reqs else 'empty dependency list', V=2):
-      try:
-        resolved = working_set.resolve(all_reqs, env=self)
-      except DistributionNotFound as e:
-        TRACER.log('Failed to resolve a requirement: %s' % e)
-        TRACER.log('Current working set:')
-        for dist in working_set:
-          TRACER.log('  - %s' % dist)
-        raise
+    resolved = self._resolve(working_set, all_reqs)
 
     for dist in resolved:
-      with TRACER.timed('Activating %s' % dist):
+      with TRACER.timed('Activating %s' % dist, V=2):
         working_set.add(dist)
 
         if os.path.isdir(dist.location):
-          with TRACER.timed('Adding sitedir'):
+          with TRACER.timed('Adding sitedir', V=2):
             site.addsitedir(dist.location)
 
         dist.activate()

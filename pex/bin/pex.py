@@ -13,14 +13,15 @@ import os
 import shutil
 import sys
 from optparse import OptionGroup, OptionParser, OptionValueError
+from textwrap import TextWrapper
 
 from pex.archiver import Archiver
 from pex.base import maybe_requirement
-from pex.common import safe_delete, safe_mkdir, safe_mkdtemp
+from pex.common import die, safe_delete, safe_mkdir, safe_mkdtemp
 from pex.crawler import Crawler
 from pex.fetcher import Fetcher, PyPIFetcher
 from pex.http import Context
-from pex.installer import EggInstaller, InstallerBase, Packager
+from pex.installer import EggInstaller
 from pex.interpreter import PythonInterpreter
 from pex.iterator import Iterator
 from pex.package import EggPackage, SourcePackage
@@ -28,19 +29,17 @@ from pex.pex import PEX
 from pex.pex_builder import PEXBuilder
 from pex.platforms import Platform
 from pex.requirements import requirements_from_file
-from pex.resolvable import Resolvable, ResolvablePackage
-from pex.resolver import CachingResolver, Resolver
+from pex.resolvable import Resolvable
+from pex.resolver import CachingResolver, Resolver, Unsatisfiable
 from pex.resolver_options import ResolverOptionsBuilder
-from pex.tracer import TRACER, TraceLogger
-from pex.version import __setuptools_requirement, __version__, __wheel_requirement
+from pex.tracer import TRACER
+from pex.variables import ENV, Variables
+from pex.version import SETUPTOOLS_REQUIREMENT, WHEEL_REQUIREMENT, __version__
 
 CANNOT_DISTILL = 101
 CANNOT_SETUP_INTERPRETER = 102
-
-
-def die(msg, error_code=1):
-  print(msg, file=sys.stderr)
-  sys.exit(error_code)
+INVALID_OPTIONS = 103
+INVALID_ENTRY_POINT = 104
 
 
 def log(msg, v=False):
@@ -55,6 +54,10 @@ def parse_bool(option, opt_str, _, parser):
 def increment_verbosity(option, opt_str, _, parser):
   verbosity = getattr(parser.values, option.dest, 0)
   setattr(parser.values, option.dest, verbosity + 1)
+
+
+def process_disable_cache(option, option_str, option_value, parser):
+  setattr(parser.values, option.dest, [])
 
 
 def process_pypi_option(option, option_str, option_value, parser, builder):
@@ -103,6 +106,14 @@ def process_precedence(option, option_str, option_value, parser, builder):
     raise OptionValueError
 
 
+def print_variable_help(option, option_str, option_value, parser):
+  for variable_name, variable_type, variable_help in Variables.iter_help():
+    print('\n%s: %s\n' % (variable_name, variable_type))
+    for line in TextWrapper(initial_indent=' ' * 4, subsequent_indent=' ' * 4).wrap(variable_help):
+      print(line)
+  sys.exit(0)
+
+
 def configure_clp_pex_resolution(parser, builder):
   group = OptionGroup(
       parser,
@@ -137,6 +148,13 @@ def configure_clp_pex_resolution(parser, builder):
       callback_args=(builder,),
       type=str,
       help='Additional cheeseshop indices to use to satisfy requirements.')
+
+  group.add_option(
+      '--disable-cache',
+      action='callback',
+      dest='cache_dir',
+      callback=process_disable_cache,
+      help='Disable caching in the pex tool entirely.')
 
   group.add_option(
       '--cache-dir',
@@ -232,6 +250,14 @@ def configure_clp_pex_environment(parser):
            'Default: Use current interpreter.')
 
   group.add_option(
+      '--python-shebang',
+      dest='python_shebang',
+      default=None,
+      help='The exact shebang (#!...) line to add at the top of the PEX file minus the '
+           '#!.  This overrides the default behavior, which picks an environment python '
+           'interpreter compatible with the one used to build the PEX file.')
+
+  group.add_option(
       '--platform',
       dest='platform',
       default=Platform.current(),
@@ -247,6 +273,32 @@ def configure_clp_pex_environment(parser):
   parser.add_option_group(group)
 
 
+def configure_clp_pex_entry_points(parser):
+  group = OptionGroup(
+      parser,
+      'PEX entry point options',
+      'Specify what target/module the PEX should invoke if any.')
+
+  group.add_option(
+      '-m', '-e', '--entry-point',
+      dest='entry_point',
+      metavar='MODULE[:SYMBOL]',
+      default=None,
+      help='Set the entry point to module or module:symbol.  If just specifying module, pex '
+           'behaves like python -m, e.g. python -m SimpleHTTPServer.  If specifying '
+           'module:symbol, pex imports that symbol and invokes it as if it were main.')
+
+  group.add_option(
+      '-c', '--script', '--console-script',
+      dest='script',
+      default=None,
+      metavar='SCRIPT_NAME',
+      help='Set the entry point as to the script or console_script as defined by a any of the '
+           'distributions in the pex.  For example: "pex -c fab fabric" or "pex -c mturk boto".')
+
+  parser.add_option_group(group)
+
+
 def configure_clp():
   usage = (
       '%prog [-o OUTPUT.PEX] [options] [-- arg1 arg2 ...]\n\n'
@@ -258,6 +310,7 @@ def configure_clp():
   configure_clp_pex_resolution(parser, resolver_options_builder)
   configure_clp_pex_options(parser)
   configure_clp_pex_environment(parser)
+  configure_clp_pex_entry_points(parser)
 
   parser.add_option(
       '-o', '--output-file',
@@ -265,14 +318,6 @@ def configure_clp():
       default=None,
       help='The name of the generated .pex file: Omiting this will run PEX '
            'immediately and not save it to a file.')
-
-  parser.add_option(
-      '-e', '--entry-point',
-      dest='entry_point',
-      default=None,
-      help='The entry point for this pex; Omiting this will enter the python '
-           'REPL with sources and requirements available for import.  Can be '
-           'either a module or EntryPoint (module:function) format.')
 
   parser.add_option(
       '-r', '--requirement',
@@ -285,21 +330,19 @@ def configure_clp():
            'times.')
 
   parser.add_option(
-      '-s', '--source-dir',
-      dest='source_dirs',
-      metavar='DIR',
-      default=[],
-      action='append',
-      help='Source to be packaged; This <DIR> should be a pip-installable project '
-           'with a setup.py.')
-
-  parser.add_option(
       '-v',
       dest='verbosity',
       default=0,
       action='callback',
       callback=increment_verbosity,
       help='Turn on logging verbosity, may be specified multiple times.')
+
+  parser.add_option(
+      '--help-variables',
+      action='callback',
+      callback=print_variable_help,
+      help='Print out help about the various environment variables used to change the behavior of '
+           'a running PEX file.')
 
   return parser, resolver_options_builder
 
@@ -387,11 +430,11 @@ def interpreter_from_options(options):
     resolve = functools.partial(resolve_interpreter, options.interpreter_cache_dir, options.repos)
 
     # resolve setuptools
-    interpreter = resolve(interpreter, __setuptools_requirement)
+    interpreter = resolve(interpreter, SETUPTOOLS_REQUIREMENT)
 
     # possibly resolve wheel
     if interpreter and options.use_wheel:
-      interpreter = resolve(interpreter, __wheel_requirement)
+      interpreter = resolve(interpreter, WHEEL_REQUIREMENT)
 
     return interpreter
 
@@ -416,15 +459,6 @@ def build_pex(args, options, resolver_option_builder):
   for requirements_txt in options.requirement_files:
     resolvables.extend(requirements_from_file(requirements_txt, resolver_option_builder))
 
-  if options.source_dirs:
-    for source_dir in options.source_dirs:
-      try:
-        sdist = Packager(source_dir, interpreter=interpreter).sdist()
-      except InstallerBase.Error:
-        die('Failed to run installer for %s' % source_dir, CANNOT_DISTILL)
-
-      resolvables.append(ResolvablePackage.from_string(sdist, resolver_option_builder))
-
   resolver_kwargs = dict(interpreter=interpreter, platform=options.platform)
 
   if options.cache_dir:
@@ -433,18 +467,26 @@ def build_pex(args, options, resolver_option_builder):
     resolver = Resolver(**resolver_kwargs)
 
   with TRACER.timed('Resolving distributions'):
-    resolveds = resolver.resolve(resolvables)
+    try:
+      resolveds = resolver.resolve(resolvables)
+    except Unsatisfiable as e:
+      die(e)
 
   for dist in resolveds:
     log('  %s' % dist, v=options.verbosity)
     pex_builder.add_distribution(dist)
     pex_builder.add_requirement(dist.as_requirement())
 
-  if options.entry_point is not None:
-    log('Setting entry point to %s' % options.entry_point, v=options.verbosity)
-    pex_builder.info.entry_point = options.entry_point
-  else:
-    log('Creating environment PEX.', v=options.verbosity)
+  if options.entry_point and options.script:
+    die('Must specify at most one entry point or script.', INVALID_OPTIONS)
+
+  if options.entry_point:
+    pex_builder.set_entry_point(options.entry_point)
+  elif options.script:
+    pex_builder.set_script(options.script)
+
+  if options.python_shebang:
+    pex_builder.set_shebang(options.python_shebang)
 
   return pex_builder
 
@@ -462,7 +504,7 @@ def main():
 
   options, reqs = parser.parse_args(args=args)
 
-  with TraceLogger.env_override(PEX_VERBOSE=options.verbosity):
+  with ENV.patch(PEX_VERBOSE=str(options.verbosity)):
     with TRACER.timed('Building pex'):
       pex_builder = build_pex(reqs, options, resolver_options_builder)
 
@@ -481,7 +523,7 @@ def main():
 
     log('Running PEX file at %s with args %s' % (pex_builder.path(), cmdline), v=options.verbosity)
     pex = PEX(pex_builder.path(), interpreter=pex_builder.interpreter)
-    return pex.run(args=list(cmdline))
+    sys.exit(pex.run(args=list(cmdline)))
 
 
 if __name__ == '__main__':

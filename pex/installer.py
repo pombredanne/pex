@@ -13,6 +13,7 @@ from pkg_resources import Distribution, PathMetadata
 from .common import safe_mkdtemp, safe_rmtree
 from .interpreter import PythonInterpreter
 from .tracer import TRACER
+from .version import SETUPTOOLS_REQUIREMENT, WHEEL_REQUIREMENT
 
 __all__ = (
   'Installer',
@@ -34,6 +35,7 @@ class InstallerBase(object):
   SETUP_BOOTSTRAP_MODULE = "sys.path.insert(0, %(path)r); import %(module)s"
   SETUP_BOOTSTRAP_FOOTER = """
 __file__ = 'setup.py'
+sys.argv[0] = 'setup.py'
 exec(compile(open(__file__).read().replace('\\r\\n', '\\n'), __file__, 'exec'))
 """
 
@@ -188,7 +190,7 @@ class Installer(InstallerBase):
 class DistributionPackager(InstallerBase):
   def mixins(self):
     mixins = super(DistributionPackager, self).mixins().copy()
-    mixins.update(setuptools='setuptools>=1')
+    mixins.update(setuptools=SETUPTOOLS_REQUIREMENT)
     return mixins
 
   def find_distribution(self):
@@ -232,8 +234,8 @@ class WheelInstaller(DistributionPackager):
     Create a source distribution from an unpacked setup.py-based project.
   """
   MIXINS = {
-      'setuptools': 'setuptools>=2',
-      'wheel': 'wheel>=0.17',
+      'setuptools': SETUPTOOLS_REQUIREMENT,
+      'wheel': WHEEL_REQUIREMENT,
   }
 
   def mixins(self):

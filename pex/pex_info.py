@@ -5,17 +5,20 @@ from __future__ import absolute_import, print_function
 
 import json
 import os
-import sys
 import warnings
 from collections import namedtuple
 
 from .common import open_zip
 from .compatibility import string as compatibility_string
+from .compatibility import PY2
 from .orderedset import OrderedSet
+from .variables import ENV
 
 PexPlatform = namedtuple('PexPlatform', 'interpreter version strict')
 
 
+# TODO(wickman) Split this into a PexInfoBuilder/PexInfo to ensure immutability.
+# Issue #92.
 class PexInfo(object):
   """PEX metadata.
 
@@ -24,18 +27,19 @@ class PexInfo(object):
   code_hash: str                    # sha1 hash of all names/code in the archive
   distributions: {dist_name: str}   # map from distribution name (i.e. path in
                                     # the internal cache) to its cache key (sha1)
+  requirements: list                # list of requirements for this environment
 
   # Environment options
   pex_root: ~/.pex                   # root of all pex-related files
   entry_point: string                # entry point into this pex
+  script: string                     # script to execute in this pex environment
+                                     # at most one of script/entry_point can be specified
   zip_safe: True, default False      # is this pex zip safe?
   inherit_path: True, default False  # should this pex inherit site-packages + PYTHONPATH?
   ignore_errors: True, default False # should we ignore inability to resolve dependencies?
   always_write_cache: False          # should we always write the internal cache to disk first?
                                      # this is useful if you have very large dependencies that
                                      # do not fit in RAM constrained environments
-  requirements: list                 # list of requirements for this environment
-
 
   .. versionchanged:: 0.8
     Removed the ``repositories`` and ``indices`` information, as they were never
@@ -62,7 +66,6 @@ class PexInfo(object):
     pex_info = {
       'requirements': [],
       'distributions': {},
-      'always_write_cache': False,
       'build_properties': cls.make_build_properties(),
     }
     return cls(info=pex_info)
@@ -81,7 +84,23 @@ class PexInfo(object):
   def from_json(cls, content):
     if isinstance(content, bytes):
       content = content.decode('utf-8')
-    return PexInfo(info=json.loads(content))
+    return cls(info=json.loads(content))
+
+  @classmethod
+  def from_env(cls, env=ENV):
+    supplied_env = env.strip_defaults()
+    zip_safe = None if supplied_env.PEX_FORCE_LOCAL is None else not supplied_env.PEX_FORCE_LOCAL
+    pex_info = {
+      'pex_root': supplied_env.PEX_ROOT,
+      'entry_point': supplied_env.PEX_MODULE,
+      'script': supplied_env.PEX_SCRIPT,
+      'zip_safe': zip_safe,
+      'inherit_path': supplied_env.PEX_INHERIT_PATH,
+      'ignore_errors': supplied_env.PEX_IGNORE_ERRORS,
+      'always_write_cache': supplied_env.PEX_ALWAYS_CACHE,
+    }
+    # Filter out empty entries not explicitly set in the environment.
+    return cls(info=dict((k, v) for (k, v) in pex_info.items() if v is not None))
 
   @classmethod
   def _parse_requirement_tuple(cls, requirement_tuple):
@@ -95,11 +114,6 @@ class PexInfo(object):
       return requirement_tuple
     raise ValueError('Malformed PEX requirement: %r' % (requirement_tuple,))
 
-  @classmethod
-  def debug(cls, msg):
-    if 'PEX_VERBOSE' in os.environ:
-      print('PEX: %s' % msg, file=sys.stderr)
-
   def __init__(self, info=None):
     """Construct a new PexInfo.  This should not be used directly."""
 
@@ -112,6 +126,12 @@ class PexInfo(object):
     if not isinstance(requirements, (list, tuple)):
       raise ValueError('Expected requirements to be a list, got %s' % type(requirements))
     self._requirements = OrderedSet(self._parse_requirement_tuple(req) for req in requirements)
+
+  def _get_safe(self, key):
+    if key not in self._pex_info:
+      return None
+    value = self._pex_info[key]
+    return value.encode('utf-8') if PY2 else value
 
   @property
   def build_properties(self):
@@ -139,9 +159,6 @@ class PexInfo(object):
     By default zip_safe is True.  May be overridden at runtime by the $PEX_FORCE_LOCAL environment
     variable.
     """
-    if 'PEX_FORCE_LOCAL' in os.environ:
-      self.debug('PEX_FORCE_LOCAL forcing zip_safe to False')
-      return False
     return self._pex_info.get('zip_safe', True)
 
   @zip_safe.setter
@@ -158,11 +175,7 @@ class PexInfo(object):
     By default inherit_path is False.  This may be overridden at runtime by the $PEX_INHERIT_PATH
     environment variable.
     """
-    if 'PEX_INHERIT_PATH' in os.environ:
-      self.debug('PEX_INHERIT_PATH override detected')
-      return True
-    else:
-      return self._pex_info.get('inherit_path', False)
+    return self._pex_info.get('inherit_path', False)
 
   @inherit_path.setter
   def inherit_path(self, value):
@@ -186,14 +199,19 @@ class PexInfo(object):
 
   @property
   def entry_point(self):
-    if 'PEX_MODULE' in os.environ:
-      self.debug('PEX_MODULE override detected: %s' % os.environ['PEX_MODULE'])
-      return os.environ['PEX_MODULE']
-    return self._pex_info.get('entry_point')
+    return self._get_safe('entry_point')
 
   @entry_point.setter
   def entry_point(self, value):
     self._pex_info['entry_point'] = value
+
+  @property
+  def script(self):
+    return self._get_safe('script')
+
+  @script.setter
+  def script(self, value):
+    self._pex_info['script'] = value
 
   def add_requirement(self, requirement):
     self._requirements.add(str(requirement))
@@ -211,9 +229,6 @@ class PexInfo(object):
 
   @property
   def always_write_cache(self):
-    if 'PEX_ALWAYS_CACHE' in os.environ:
-      self.debug('PEX_ALWAYS_CACHE override detected: %s' % os.environ['PEX_ALWAYS_CACHE'])
-      return True
     return self._pex_info.get('always_write_cache', False)
 
   @always_write_cache.setter
@@ -222,8 +237,7 @@ class PexInfo(object):
 
   @property
   def pex_root(self):
-    pex_root = self._pex_info.get('pex_root', os.path.join('~', '.pex'))
-    return os.path.expanduser(os.environ.get('PEX_ROOT', pex_root))
+    return os.path.expanduser(self._pex_info.get('pex_root', os.path.join('~', '.pex')))
 
   @pex_root.setter
   def pex_root(self, value):
@@ -241,10 +255,18 @@ class PexInfo(object):
   def zip_unsafe_cache(self):
     return os.path.join(self.pex_root, 'code')
 
-  def dump(self):
+  def update(self, other):
+    if not isinstance(other, PexInfo):
+      raise TypeError('Cannot merge a %r with PexInfo' % type(other))
+    self._pex_info.update(other._pex_info)
+    self._distributions.update(other.distributions)
+    self._requirements.update(other.requirements)
+
+  def dump(self, **kwargs):
     pex_info_copy = self._pex_info.copy()
     pex_info_copy['requirements'] = list(self._requirements)
-    return json.dumps(pex_info_copy)
+    pex_info_copy['distributions'] = self._distributions.copy()
+    return json.dumps(pex_info_copy, **kwargs)
 
   def copy(self):
-    return PexInfo(info=self._pex_info.copy())
+    return self.from_json(self.dump())

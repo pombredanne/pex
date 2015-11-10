@@ -17,6 +17,11 @@ from collections import defaultdict
 from uuid import uuid4
 
 
+def die(msg, exit_code=1):
+  print(msg, file=sys.stderr)
+  sys.exit(exit_code)
+
+
 def safe_copy(source, dest, overwrite=False):
   def do_copy():
     temp_dest = dest + uuid4().hex
@@ -59,10 +64,7 @@ class MktempTeardownRegistry(object):
   def teardown(self):
     for td in self._registry.pop(self._getpid(), []):
       if self._exists(td):
-        if self._getenv('PEX_LEAVE_TEMPDIRS'):
-          print('Left temporary dir: %s' % td, file=sys.stderr)
-        else:
-          self._rmtree(td)
+        self._rmtree(td)
 
 
 _MKDTEMP_SINGLETON = MktempTeardownRegistry()
@@ -291,7 +293,8 @@ class Chroot(object):
     Has similar exceptional cases as Chroot.copy
     """
     dst = self._normalize(dst)
-    self.write('', dst, label, mode='a')
+    self._tag(dst, label)
+    touch(os.path.join(self.chroot, dst))
 
   def get(self, label):
     """Get all files labeled with ``label``"""

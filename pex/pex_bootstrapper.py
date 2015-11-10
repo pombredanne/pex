@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+import sys
 import zipfile
 
 __all__ = ('bootstrap_pex',)
@@ -45,7 +46,7 @@ def get_pex_info(entry_point):
   raise ValueError('Invalid entry_point: %s' % entry_point)
 
 
-# TODO(wickman) Remove once resolved:
+# TODO(wickman) Remove once resolved (#91):
 #   https://bitbucket.org/pypa/setuptools/issue/154/build_zipmanifest-results-should-be
 def monkeypatch_build_zipmanifest():
   import pkg_resources
@@ -59,10 +60,40 @@ def monkeypatch_build_zipmanifest():
   pkg_resources.build_zipmanifest = memoized_build_zipmanifest
 
 
+def find_in_path(target_interpreter):
+  if os.path.exists(target_interpreter):
+    return target_interpreter
+
+  for directory in os.getenv('PATH', '').split(os.pathsep):
+    try_path = os.path.join(directory, target_interpreter)
+    if os.path.exists(try_path):
+      return try_path
+
+
+def maybe_reexec_pex():
+  from .variables import ENV
+  if not ENV.PEX_PYTHON:
+    return
+
+  from .common import die
+  from .tracer import TRACER
+
+  target_python = ENV.PEX_PYTHON
+  target = find_in_path(target_python)
+  if not target:
+    die('Failed to find interpreter specified by PEX_PYTHON: %s' % target)
+  current = os.path.realpath(sys.executable)
+  if os.path.exists(target) and target != current:
+    TRACER.log('Detected PEX_PYTHON, re-exec to %s' % target)
+    ENV.delete('PEX_PYTHON')
+    os.execve(target, [target_python] + sys.argv, ENV.copy())
+
+
 def bootstrap_pex(entry_point):
   from .finders import register_finders
   monkeypatch_build_zipmanifest()
   register_finders()
+  maybe_reexec_pex()
 
   from . import pex
   pex.PEX(entry_point).execute()

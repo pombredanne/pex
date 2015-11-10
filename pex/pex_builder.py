@@ -10,8 +10,9 @@ from pkg_resources import DefaultProvider, ZipProvider, get_provider
 
 from .common import Chroot, chmod_plus_x, open_zip, safe_mkdir, safe_mkdtemp
 from .compatibility import to_bytes
+from .compiler import Compiler
+from .finders import get_entry_point_from_console_script, get_script_from_distributions
 from .interpreter import PythonInterpreter
-from .marshaller import CodeMarshaller
 from .pex_info import PexInfo
 from .util import CacheHelper, DistributionHelper
 
@@ -54,7 +55,8 @@ class PEXBuilder(object):
 
   BOOTSTRAP_DIR = ".bootstrap"
 
-  def __init__(self, path=None, interpreter=None, chroot=None, pex_info=None, preamble=None):
+  def __init__(self, path=None, interpreter=None, chroot=None, pex_info=None, preamble=None,
+               copy=False):
     """Initialize a pex builder.
 
     :keyword path: The path to write the PEX as it is built.  If ``None`` is specified,
@@ -66,6 +68,8 @@ class PEXBuilder(object):
     :keyword preamble: If supplied, execute this code prior to bootstrapping this PEX
       environment.
     :type preamble: str
+    :keyword copy: If False, attempt to create the pex environment via hard-linking, falling
+                   back to copying across devices. If True, always copy.
 
     .. versionchanged:: 0.8
       The temporary directory created when ``path`` is not specified is now garbage collected on
@@ -75,8 +79,11 @@ class PEXBuilder(object):
     self._pex_info = pex_info or PexInfo.default()
     self._frozen = False
     self._interpreter = interpreter or PythonInterpreter.get()
+    self._shebang = self._interpreter.identity.hashbang()
     self._logger = logging.getLogger(__name__)
     self._preamble = to_bytes(preamble or '')
+    self._copy = copy
+    self._distributions = set()
 
   def _ensure_unfrozen(self, name='Operation'):
     if self._frozen:
@@ -103,8 +110,13 @@ class PEXBuilder(object):
       interpreter exit.
     """
     chroot_clone = self._chroot.clone(into=into)
-    return self.__class__(
-        chroot=chroot_clone, interpreter=self._interpreter, pex_info=self._pex_info.copy())
+    clone = self.__class__(
+        chroot=chroot_clone,
+        interpreter=self._interpreter,
+        pex_info=self._pex_info.copy())
+    for dist in self._distributions:
+      clone.add_distribution(dist)
+    return clone
 
   def path(self):
     return self.chroot().path()
@@ -120,7 +132,6 @@ class PEXBuilder(object):
     self._ensure_unfrozen('Changing PexInfo')
     self._pex_info = value
 
-  # TODO(wickman) Add option to not compile/marshal sources.
   def add_source(self, filename, env_filename):
     """Add a source to the PEX environment.
 
@@ -129,12 +140,7 @@ class PEXBuilder(object):
       must be a relative path.
     """
     self._ensure_unfrozen('Adding source')
-    self._chroot.link(filename, env_filename, "source")
-    if filename.endswith('.py'):
-      env_filename_pyc = os.path.splitext(env_filename)[0] + '.pyc'
-      with open(filename) as fp:
-        pyc_object = CodeMarshaller.from_py(fp.read(), env_filename)
-      self._chroot.write(pyc_object.to_pyc(), env_filename_pyc, 'source')
+    self._copy_or_link(filename, env_filename, "source")
 
   def add_resource(self, filename, env_filename):
     """Add a resource to the PEX environment.
@@ -144,7 +150,7 @@ class PEXBuilder(object):
       must be a relative path.
     """
     self._ensure_unfrozen('Adding a resource')
-    self._chroot.link(filename, env_filename, "resource")
+    self._copy_or_link(filename, env_filename, "resource")
 
   def add_requirement(self, req):
     """Add a requirement to the PEX environment.
@@ -156,6 +162,56 @@ class PEXBuilder(object):
     """
     self._ensure_unfrozen('Adding a requirement')
     self._pex_info.add_requirement(req)
+
+  def set_executable(self, filename, env_filename=None):
+    """Set the executable for this environment.
+
+    :param filename: The file that should be executed within the PEX environment when the PEX is
+      invoked.
+    :keyword env_filename: (optional) The name that the executable file should be stored as within
+      the PEX.  By default this will be the base name of the given filename.
+
+    The entry point of the PEX may also be specified via ``PEXBuilder.set_entry_point``.
+    """
+    self._ensure_unfrozen('Setting the executable')
+    if self._pex_info.script:
+      raise self.InvalidExecutableSpecification('Cannot set both entry point and script of PEX!')
+    if env_filename is None:
+      env_filename = os.path.basename(filename)
+    if self._chroot.get("executable"):
+      raise self.InvalidExecutableSpecification(
+          "Setting executable on a PEXBuilder that already has one!")
+    self._copy_or_link(filename, env_filename, "executable")
+    entry_point = env_filename
+    entry_point.replace(os.path.sep, '.')
+    self._pex_info.entry_point = entry_point.rpartition('.')[0]
+
+  def set_script(self, script):
+    """Set the entry point of this PEX environment based upon a distribution script.
+
+    :param script: The script name as defined either by a console script or ordinary
+      script within the setup.py of one of the distributions added to the PEX.
+    :raises: :class:`PEXBuilder.InvalidExecutableSpecification` if the script is not found
+      in any distribution added to the PEX.
+    """
+
+    # check if 'script' is a console_script
+    entry_point = get_entry_point_from_console_script(script, self._distributions)
+    if entry_point:
+      self.set_entry_point(entry_point)
+      return
+
+    # check if 'script' is an ordinary script
+    script_path, _, _ = get_script_from_distributions(script, self._distributions)
+    if script_path:
+      if self._pex_info.entry_point:
+        raise self.InvalidExecutableSpecification('Cannot set both entry point and script of PEX!')
+      self._pex_info.script = script
+      return
+
+    raise self.InvalidExecutableSpecification(
+        'Could not find script %r in any distribution %s within PEX!' % (
+            script, ', '.join(self._distributions)))
 
   def set_entry_point(self, entry_point):
     """Set the entry point of this PEX environment.
@@ -173,13 +229,25 @@ class PEXBuilder(object):
     self._ensure_unfrozen('Setting an entry point')
     self._pex_info.entry_point = entry_point
 
+  def set_shebang(self, shebang):
+    """Set the exact shebang line for the PEX file.
+
+    For example, pex_builder.set_shebang('/home/wickman/Local/bin/python3.4').  This is
+    used to override the default behavior which is to have a #!/usr/bin/env line referencing an
+    interpreter compatible with the one used to build the PEX.
+
+    :param shebang: The shebang line minus the #!.
+    :type shebang: str
+    """
+    self._shebang = '#!%s' % shebang
+
   def _add_dist_dir(self, path, dist_name):
     for root, _, files in os.walk(path):
       for f in files:
         filename = os.path.join(root, f)
         relpath = os.path.relpath(filename, path)
         target = os.path.join(self._pex_info.internal_cache, dist_name, relpath)
-        self._chroot.link(filename, target)
+        self._copy_or_link(filename, target)
     return CacheHelper.dir_hash(path)
 
   def _add_dist_zip(self, path, dist_name):
@@ -204,6 +272,7 @@ class PEXBuilder(object):
     """
     self._ensure_unfrozen('Adding a distribution')
     dist_name = dist_name or os.path.basename(dist.location)
+    self._distributions.add(dist)
 
     if os.path.isdir(dist.location):
       dist_hash = self._add_dist_dir(dist.location, dist_name)
@@ -237,29 +306,6 @@ class PEXBuilder(object):
     self._ensure_unfrozen('Adding an egg')
     return self.add_dist_location(egg)
 
-  # TODO(wickman) Consider warning/erroring should set_executable and set_entry_point both be
-  #  specified, or each specified more than once.
-  def set_executable(self, filename, env_filename=None):
-    """Set the executable for this environment.
-
-    :param filename: The file that should be executed within the PEX environment when the PEX is
-      invoked.
-    :keyword env_filename: (optional) The name that the executable file should be stored as within
-      the PEX.  By default this will be the base name of the given filename.
-
-    The entry point of the PEX may also be specified via ``PEXBuilder.set_entry_point``.
-    """
-    self._ensure_unfrozen('Setting the executable')
-    if env_filename is None:
-      env_filename = os.path.basename(filename)
-    if self._chroot.get("executable"):
-      raise self.InvalidExecutableSpecification(
-          "Setting executable on a PEXBuilder that already has one!")
-    self._chroot.link(filename, env_filename, "executable")
-    entry_point = env_filename
-    entry_point.replace(os.path.sep, '.')
-    self._pex_info.entry_point = entry_point.rpartition('.')[0]
-
   # TODO(wickman) Consider changing this behavior to put the onus on the consumer
   # of pex to write the pex sources correctly.
   def _prepare_inits(self):
@@ -270,9 +316,22 @@ class PEXBuilder(object):
       for k in range(1, len(split_path)):
         sub_path = os.path.sep.join(split_path[0:k] + ['__init__.py'])
         if sub_path not in relative_digest and sub_path not in init_digest:
-          self._chroot.write("__import__('pkg_resources').declare_namespace(__name__)",
-              sub_path)
+          import_string = "__import__('pkg_resources').declare_namespace(__name__)"
+          try:
+            self._chroot.write(import_string, sub_path)
+          except TypeError:
+            # Python 3
+            self._chroot.write(bytes(import_string, 'UTF-8'), sub_path)
           init_digest.add(sub_path)
+
+  def _precompile_source(self):
+    source_relpaths = [path for label in ('source', 'executable', 'main', 'bootstrap')
+                       for path in self._chroot.filesets.get(label, ()) if path.endswith('.py')]
+
+    compiler = Compiler(self.interpreter)
+    compiled_relpaths = compiler.compile(self._chroot.path(), source_relpaths)
+    for compiled in compiled_relpaths:
+      self._chroot.touch(compiled, label='bytecode')
 
   def _prepare_manifest(self):
     self._chroot.write(self._pex_info.dump().encode('utf-8'), PexInfo.PATH, label='manifest')
@@ -280,6 +339,12 @@ class PEXBuilder(object):
   def _prepare_main(self):
     self._chroot.write(self._preamble + b'\n' + BOOTSTRAP_ENVIRONMENT,
         '__main__.py', label='main')
+
+  def _copy_or_link(self, src, dst, label=None):
+    if self._copy:
+      self._chroot.copy(src, dst, label)
+    else:
+      self._chroot.link(src, dst, label)
 
   # TODO(wickman) Ideally we unqualify our setuptools dependency and inherit whatever is
   # bundled into the environment so long as it is compatible (and error out if not.)
@@ -301,8 +366,10 @@ class PEXBuilder(object):
 
     for fn, content_stream in DistributionHelper.walk_data(setuptools):
       if fn.startswith('pkg_resources') or fn.startswith('_markerlib'):
-        self._chroot.write(content_stream.read(), os.path.join(self.BOOTSTRAP_DIR, fn), 'resource')
-        wrote_setuptools = True
+        if not fn.endswith('.pyc'):  # We'll compile our own .pyc's later.
+          dst = os.path.join(self.BOOTSTRAP_DIR, fn)
+          self._chroot.write(content_stream.read(), dst, 'bootstrap')
+          wrote_setuptools = True
 
     if not wrote_setuptools:
       raise RuntimeError(
@@ -321,10 +388,12 @@ class PEXBuilder(object):
       for fn in provider.resource_listdir(''):
         if fn.endswith('.py'):
           self._chroot.write(provider.get_resource_string(source_name, fn),
-            os.path.join(self.BOOTSTRAP_DIR, target_location, fn), 'resource')
+            os.path.join(self.BOOTSTRAP_DIR, target_location, fn), 'bootstrap')
 
-  def freeze(self):
+  def freeze(self, bytecode_compile=True):
     """Freeze the PEX.
+
+    :param bytecode_compile: If True, precompile .py files into .pyc files when freezing code.
 
     Freezing the PEX writes all the necessary metadata and environment bootstrapping code.  It may
     only be called once and renders the PEXBuilder immutable.
@@ -335,18 +404,21 @@ class PEXBuilder(object):
     self._prepare_manifest()
     self._prepare_bootstrap()
     self._prepare_main()
+    if bytecode_compile:
+      self._precompile_source()
     self._frozen = True
 
-  def build(self, filename):
+  def build(self, filename, bytecode_compile=True):
     """Package the PEX into a zipfile.
 
     :param filename: The filename where the PEX should be stored.
+    :param bytecode_compile: If True, precompile .py files into .pyc files.
 
     If the PEXBuilder is not yet frozen, it will be frozen by ``build``.  This renders the
     PEXBuilder immutable.
     """
     if not self._frozen:
-      self.freeze()
+      self.freeze(bytecode_compile=bytecode_compile)
     try:
       os.unlink(filename + '~')
       self._logger.warn('Previous binary unexpectedly exists, cleaning: %s' % (filename + '~'))
@@ -357,7 +429,7 @@ class PEXBuilder(object):
       safe_mkdir(os.path.dirname(filename))
     with open(filename + '~', 'ab') as pexfile:
       assert os.path.getsize(pexfile.name) == 0
-      pexfile.write(to_bytes('%s\n' % self._interpreter.identity.hashbang()))
+      pexfile.write(to_bytes('%s\n' % self._shebang))
     self._chroot.zip(filename + '~', mode='a')
     if os.path.exists(filename):
       os.unlink(filename)

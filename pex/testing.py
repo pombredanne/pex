@@ -72,12 +72,16 @@ PROJECT_CONTENT = {
           version='0.0.0',
           zip_safe=%(zip_safe)r,
           packages=['my_package'],
+          scripts=[
+              'scripts/hello_world',
+              'scripts/shell_script',
+          ],
           package_data={'my_package': ['package_data/*.dat']},
+          install_requires=%(install_requires)r,
       )
   '''),
-  'MANIFEST.in': dedent('''
-  include setup.py
-  '''),
+  'scripts/hello_world': '#!/usr/bin/env python\nprint("hello world!")\n',
+  'scripts/shell_script': '#!/usr/bin/env bash\necho hello world\n',
   'my_package/__init__.py': 0,
   'my_package/my_module.py': 'def do_something():\n  print("hello world!")\n',
   'my_package/package_data/resource1.dat': 1000,
@@ -86,14 +90,23 @@ PROJECT_CONTENT = {
 
 
 @contextlib.contextmanager
-def make_installer(name='my_project', installer_impl=EggInstaller, zip_safe=True):
-  interp = {'project_name': name, 'zip_safe': zip_safe}
+def make_installer(name='my_project', installer_impl=EggInstaller, zip_safe=True,
+                   install_reqs=None):
+  interp = {'project_name': name, 'zip_safe': zip_safe, 'install_requires': install_reqs or []}
   with temporary_content(PROJECT_CONTENT, interp=interp) as td:
     yield installer_impl(td)
 
 
-def make_sdist(name='my_project', zip_safe=True):
-  with make_installer(name=name, installer_impl=Packager, zip_safe=zip_safe) as packager:
+@contextlib.contextmanager
+def make_source_dir(name='my_project', install_reqs=None):
+  interp = {'project_name': name, 'zip_safe': True, 'install_requires': install_reqs or []}
+  with temporary_content(PROJECT_CONTENT, interp=interp) as td:
+    yield td
+
+
+def make_sdist(name='my_project', zip_safe=True, install_reqs=None):
+  with make_installer(name=name, installer_impl=Packager, zip_safe=zip_safe,
+                      install_reqs=install_reqs) as packager:
     return packager.sdist()
 
 
@@ -122,6 +135,14 @@ except ImportError:
 
 
 def write_simple_pex(td, exe_contents, dists=None, coverage=False):
+  """Write a pex file that contains an executable entry point
+
+  :param td: temporary directory path
+  :param exe_contents: entry point python file
+  :type exe_contents: string
+  :param dists: distributions to include, typically sdists or bdists
+  :param coverage: include coverage header
+  """
   dists = dists or []
 
   with open(os.path.join(td, 'exe.py'), 'w') as fp:

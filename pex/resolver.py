@@ -6,6 +6,9 @@ from __future__ import print_function
 import os
 import shutil
 import time
+from collections import namedtuple
+
+from pkg_resources import safe_name
 
 from .common import safe_mkdir
 from .fetcher import Fetcher
@@ -17,6 +20,7 @@ from .platforms import Platform
 from .resolvable import ResolvableRequirement, resolvables_from_iterable
 from .resolver_options import ResolverOptionsBuilder
 from .tracer import TRACER
+from .util import DistributionHelper
 
 
 class Untranslateable(Exception):
@@ -39,13 +43,28 @@ class StaticIterator(IteratorInterface):
         yield package
 
 
-class _ResolvableSet(object):
-  class Error(Exception): pass
-  class Unsatisfiable(Error): pass
+class _ResolvedPackages(namedtuple('_ResolvedPackages', 'resolvable packages parent')):
+  @classmethod
+  def empty(cls):
+    return cls(None, OrderedSet(), None)
 
-  def __init__(self):
-    # Pairs of (resolvable, resolved_packages)
-    self.__tuples = []
+  def merge(self, other):
+    if other.resolvable is None:
+      return _ResolvedPackages(self.resolvable, self.packages, self.parent)
+    return _ResolvedPackages(
+        self.resolvable,
+        self.packages & other.packages,
+        self.parent)
+
+
+class _ResolvableSet(object):
+  @classmethod
+  def normalize(cls, name):
+    return safe_name(name).lower()
+
+  def __init__(self, tuples=None):
+    # A list of _ResolvedPackages
+    self.__tuples = tuples or []
 
   def _collapse(self):
     # Collapse all resolvables by name along with the intersection of all compatible packages.
@@ -57,28 +76,40 @@ class _ResolvableSet(object):
     # resolvable wins" but it seems highly unlikely this will materially affect anybody
     # adversely but could be the source of subtle resolution quirks.
     resolvables = {}
-    for resolvable, packages in self.__tuples:
-      first_resolvable, old_packages = resolvables.get(resolvable.name, (None, OrderedSet()))
-      if not first_resolvable:
-        resolvables[resolvable.name] = (resolvable, OrderedSet(packages))
+    for resolved_packages in self.__tuples:
+      key = self.normalize(resolved_packages.resolvable.name)
+      previous = resolvables.get(key, _ResolvedPackages.empty())
+      if previous.resolvable is None:
+        resolvables[key] = resolved_packages
       else:
-        resolvables[resolvable.name] = (first_resolvable, old_packages & packages)
+        resolvables[key] = previous.merge(resolved_packages)
     return resolvables
+
+  def _synthesize_parents(self, name):
+    def render_resolvable(resolved_packages):
+      return '%s%s' % (
+          str(resolved_packages.resolvable),
+          '(from: %s)' % resolved_packages.parent if resolved_packages.parent else '')
+    return ', '.join(
+        render_resolvable(resolved_packages) for resolved_packages in self.__tuples
+        if self.normalize(resolved_packages.resolvable.name) == self.normalize(name))
 
   def _check(self):
     # Check whether or not the resolvables in this set are satisfiable, raise an exception if not.
-    for name, (resolvable, packages) in self._collapse().items():
-      if not packages:
-        raise self.Unsatisfiable('Could not satisfy all requirements for %s' % resolvable)
+    for name, resolved_packages in self._collapse().items():
+      if not resolved_packages.packages:
+        raise Unsatisfiable('Could not satisfy all requirements for %s:\n    %s' % (
+            resolved_packages.resolvable, self._synthesize_parents(name)))
 
-  def merge(self, resolvable, packages):
+  def merge(self, resolvable, packages, parent=None):
     """Add a resolvable and its resolved packages."""
-    self.__tuples.append((resolvable, OrderedSet(packages)))
+    self.__tuples.append(_ResolvedPackages(resolvable, OrderedSet(packages), parent))
     self._check()
 
   def get(self, name):
     """Get the set of compatible packages given a resolvable name."""
-    resolvable, packages = self._collapse().get(name, (None, OrderedSet()))
+    resolvable, packages, parent = self._collapse().get(
+        self.normalize(name), _ResolvedPackages.empty())
     return packages
 
   def packages(self):
@@ -87,7 +118,20 @@ class _ResolvableSet(object):
 
   def extras(self, name):
     return set.union(
-        *[set(resolvable.extras()) for resolvable, _ in self.__tuples if resolvable.name == name])
+        *[set(tup.resolvable.extras()) for tup in self.__tuples
+          if self.normalize(tup.resolvable.name) == self.normalize(name)])
+
+  def replace_built(self, built_packages):
+    """Return a copy of this resolvable set but with built packages.
+
+    :param dict built_packages: A mapping from a resolved package to its locally built package.
+    :returns: A new resolvable set with built package replacements made.
+    """
+    def map_packages(resolved_packages):
+      packages = OrderedSet(built_packages.get(p, p) for p in resolved_packages.packages)
+      return _ResolvedPackages(resolved_packages.resolvable, packages, resolved_packages.parent)
+
+    return _ResolvableSet([map_packages(rp) for rp in self.__tuples])
 
 
 class Resolver(object):
@@ -127,7 +171,7 @@ class Resolver(object):
     return dist
 
   def resolve(self, resolvables, resolvable_set=None):
-    resolvables = list(resolvables)
+    resolvables = [(resolvable, None) for resolvable in resolvables]
     resolvable_set = resolvable_set or _ResolvableSet()
     processed_resolvables = set()
     processed_packages = {}
@@ -135,14 +179,15 @@ class Resolver(object):
 
     while resolvables:
       while resolvables:
-        resolvable = resolvables.pop(0)
+        resolvable, parent = resolvables.pop(0)
         if resolvable in processed_resolvables:
           continue
         packages = self.package_iterator(resolvable, existing=resolvable_set.get(resolvable.name))
-        resolvable_set.merge(resolvable, packages)
+        resolvable_set.merge(resolvable, packages, parent)
         processed_resolvables.add(resolvable)
 
-      for resolvable, packages in resolvable_set.packages():
+      built_packages = {}
+      for resolvable, packages, parent in resolvable_set.packages():
         assert len(packages) > 0, 'ResolvableSet.packages(%s) should not be empty' % resolvable
         package = next(iter(packages))
         if resolvable.name in processed_packages:
@@ -151,12 +196,19 @@ class Resolver(object):
             raise self.Error('Ambiguous resolvable: %s' % resolvable)
           continue
         if package not in distributions:
-          distributions[package] = self.build(package, resolvable.options)
+          dist = self.build(package, resolvable.options)
+          built_package = Package.from_href(dist.location)
+          built_packages[package] = built_package
+          distributions[built_package] = dist
+          package = built_package
+
         distribution = distributions[package]
         processed_packages[resolvable.name] = package
+        new_parent = '%s->%s' % (parent, resolvable) if parent else str(resolvable)
         resolvables.extend(
-            ResolvableRequirement(req, resolvable.options) for req in
+            (ResolvableRequirement(req, resolvable.options), new_parent) for req in
             distribution.requires(extras=resolvable_set.extras(resolvable.name)))
+      resolvable_set = resolvable_set.replace_built(built_packages)
 
     return list(distributions.values())
 
@@ -179,7 +231,8 @@ class CachingResolver(Resolver):
   # Short-circuiting package iterator.
   def package_iterator(self, resolvable, existing=None):
     iterator = Iterator(fetchers=[Fetcher([self.__cache])])
-    packages = resolvable.compatible(iterator)
+    packages = self.filter_packages_by_interpreter(
+        resolvable.compatible(iterator), self._interpreter, self._platform)
 
     if packages:
       if resolvable.exact:
@@ -208,7 +261,8 @@ class CachingResolver(Resolver):
       shutil.copyfile(dist.location, target + '~')
       os.rename(target + '~', target)
     os.utime(target, None)
-    return dist
+
+    return DistributionHelper.distribution_from_path(target)
 
 
 def resolve(
